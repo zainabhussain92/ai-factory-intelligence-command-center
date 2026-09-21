@@ -20,6 +20,19 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
+# Load ANTHROPIC_API_KEY / OPENAI_API_KEY from a local .env file, if one
+# exists, into the process environment. src/rag/generator.py already reads
+# these via os.environ.get(...); this just makes a local .env file (never
+# committed - see .gitignore) populate that environment automatically, so
+# the key never has to be pasted into any source file. If python-dotenv
+# isn't installed or there's no .env file, this silently does nothing and
+# the app falls back to its existing no-key behaviour.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 sys.path.append(str(Path(__file__).resolve().parent))
 from config.config import MACHINE_FLEET, PROJECT_ROOT
 from src.agents.orchestrator import run_workflow
