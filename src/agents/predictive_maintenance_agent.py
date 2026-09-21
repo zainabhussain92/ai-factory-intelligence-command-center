@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,7 @@ MODELS_DIR = PROJECT_ROOT / "models"
 SHIFT_ORDER = {"Morning": 0, "Afternoon": 1, "Night": 2}
 
 
+@lru_cache(maxsize=1)
 def _load_gru_threshold() -> float:
     metrics_path = REPORTS_DIR / "stage2_gru_metrics.json"
     if metrics_path.exists():
@@ -68,9 +70,19 @@ def _latest_window(machine_id: str, window: int) -> pd.DataFrame | None:
     return None
 
 
+@lru_cache(maxsize=1)
 def _load_gru_artifacts():
     """Load the trained GRU model + its feature contract (read-only, no
     retraining). Returns (model, contract) or (None, None) if missing.
+
+    Cached with lru_cache: this is called from three places per analysis
+    run (Predictive Maintenance Agent, Digital Twin simulator, XAI GRU
+    explainer). Without caching, the same .npz weights + JSON contract are
+    re-read from disk on every single call, which is the main cause of a
+    slow "Run Full Analysis" click. The underlying files never change while
+    the app is running, so caching them for the lifetime of the process is
+    safe - it does not change any prediction, only how often the same,
+    already-trained artifact is re-loaded from disk.
     """
     contract_path = MODELS_DIR / "gru_feature_contract.json"
     model_path = MODELS_DIR / "gru_model.npz"
