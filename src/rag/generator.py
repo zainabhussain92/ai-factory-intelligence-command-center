@@ -1,27 +1,22 @@
 """Stage IV — generation layer.
 
-Why there is no live LLM API call by default
-----------------------------------------------
-Per the Stage IV brief: "Use environment variables for API keys. Never
-hard-code API keys... If practical, provide a local/fallback mode so the
-RAG pipeline can still be tested without exposing credentials."
-
-This sandbox has no general network egress (verified: api.anthropic.com,
-api.openai.com and general internet hosts are not on the allowlist) and no
-API key is set in the environment. ``generate_grounded_answer`` therefore:
-
-1. Checks for ``ANTHROPIC_API_KEY`` or ``OPENAI_API_KEY`` in the
-   environment. If present *and* reachable, it will attempt a real API call
-   (kept isolated in ``_try_live_llm`` so it never runs unless a key
-   actually exists).
-2. Otherwise (the situation in this sandbox), it falls back to
-   ``_local_grounded_generation``: a deterministic, template-driven
-   synthesis that only ever states what is present in the retrieved
-   evidence text. It does not invent factory procedures.
+Live LLM support (Google Gemini)
+---------------------------------
+``generate_grounded_answer`` checks for a Google AI API key
+(``GOOGLE_API_KEY`` or ``GEMINI_API_KEY``) in the environment. If one is
+set, it calls the Gemini API (via the standard library's ``urllib`` -
+no extra package required) with a prompt built ONLY from the retrieved
+evidence, so the model is instructed to answer strictly from what was
+retrieved. Any failure (missing key, no network, API error, bad response)
+is caught and the function falls back to ``_local_grounded_generation``
+instead of crashing the pipeline - the app must keep working even with no
+key or no network, per the Stage IV brief ("provide a local/fallback mode
+so the RAG pipeline can still be tested without exposing credentials").
 
 This is the same fallback pattern already used for Stage II's GRU and
 Stage III's CV/NLP models (from-scratch local implementation, clearly
-documented, because the "standard" dependency could not be reached).
+documented, because the "standard" dependency could not always be
+reached).
 
 The unsupported/no-RAG generator (`generate_unsupported_answer`) is a
 *separate, explicitly labeled* function used only for the RAG-vs-no-RAG
@@ -31,7 +26,10 @@ exactly the contrast Stage IV's demonstration is supposed to show.
 """
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
+import urllib.error
 
 from src.rag.retriever import RetrievedEvidence
 
@@ -41,32 +39,59 @@ NO_EVIDENCE_MESSAGE = (
     "threshold for this query."
 )
 
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+)
+
 
 def _try_live_llm(question: str, evidence: list[RetrievedEvidence]) -> str | None:
-    """Attempt a real LLM call if a key is configured. Returns None on any
-    failure (missing key, no network, API error) so the caller can fall
-    back locally without crashing the pipeline."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    """Attempt a real Gemini API call if a Google AI key is configured.
+    Returns None on any failure (missing key, no network, API error) so the
+    caller can fall back locally without crashing the pipeline.
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return None
+
+    context = "\n\n".join(
+        f"[{e.document} p.{e.page}{' - ' + e.section if e.section else ''}] {e.evidence}"
+        for e in evidence
+    )
+    prompt = (
+        "You are a factory maintenance assistant. Answer the question "
+        "using ONLY the evidence below - do not invent procedures, "
+        "thresholds, or facts that are not stated in the evidence. If the "
+        "evidence is insufficient to answer, say so explicitly.\n\n"
+        f"Evidence:\n{context}\n\nQuestion: {question}"
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 512},
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{GEMINI_URL}?key={api_key}",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
     try:
-        import urllib.request
-        context = "\n\n".join(
-            f"[{e.document} p.{e.page}{' - ' + e.section if e.section else ''}] {e.evidence}"
-            for e in evidence
-        )
-        prompt = (
-            "Answer the factory maintenance question using ONLY the "
-            "evidence below. If the evidence is insufficient, say so.\n\n"
-            f"Evidence:\n{context}\n\nQuestion: {question}"
-        )
-        # Deliberately not wired to a specific vendor payload here — this
-        # sandbox cannot reach any LLM API to test it, so shipping an
-        # untested request builder would be worse than an honest fallback.
-        # A real deployment with network access would build the vendor's
-        # /v1/messages or /v1/chat/completions request here using `prompt`.
-        raise RuntimeError("Live LLM call not reachable in this environment.")
-    except Exception:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        candidates = body.get("candidates", [])
+        if not candidates:
+            return None
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return text or None
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            json.JSONDecodeError, KeyError, IndexError):
+        # Missing network, invalid/expired key, rate limit, malformed
+        # response, etc. - never let a live-LLM problem crash the RAG
+        # pipeline; the evidence-only fallback below still answers.
         return None
 
 
