@@ -51,3 +51,4 @@ mlflow>=2.14
 
 # Stage IX - Web Application + Automated Report
 streamlit>=1.63
+python-dotenv>=1.0
